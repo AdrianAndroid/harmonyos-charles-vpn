@@ -1,0 +1,8 @@
+{
+  "string": [
+    {
+      "name": "reason_internet",
+      "value": "自用调试，局域网转发HTTP流量至Charles抓包。"
+    }
+  ]
+}

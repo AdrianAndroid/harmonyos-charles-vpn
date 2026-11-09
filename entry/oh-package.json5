@@ -1,0 +1,11 @@
+{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "Charles VPN entry module",
+  "main": "",
+  "author": "",
+  "license": "",
+  "dependencies": {
+    "libcharles_vpn.so": "file:./src/main/cpp/types/libcharles_vpn"
+  }
+}

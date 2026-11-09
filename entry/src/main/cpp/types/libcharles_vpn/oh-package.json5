@@ -1,0 +1,6 @@
+{
+  "name": "libcharles_vpn.so",
+  "types": "./index.d.ts",
+  "version": "1.0.0",
+  "description": "NAPI declarations for the Charles TUN proxy"
+}

@@ -219,6 +219,8 @@ private:
                   size_t opts_len);
     void rebuild_pollfds(std::vector<pollfd>& fds);
     void report_event(const std::string& message);
+    void report_trace(const std::string& payload);
+    uint64_t next_flow_id() { return next_flow_id_++; }
     void emit_packet(const void* data, size_t len);
 
     std::atomic<bool> running_{false};
@@ -237,6 +239,7 @@ private:
 
     // unique_ptr keeps the nested Flow/DnsEntry definitions private to the .cpp
     // while still satisfying the container's completeness requirements.
+    uint64_t next_flow_id_ = 1;
     std::unordered_map<FlowKey, std::unique_ptr<Flow>, FlowKeyHash> flows_;
     FragmentReassembler reassembler_;
     std::unordered_map<uint64_t, std::unique_ptr<DnsEntry>> dns_;

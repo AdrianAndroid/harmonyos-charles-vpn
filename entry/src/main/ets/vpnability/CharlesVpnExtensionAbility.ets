@@ -3,7 +3,14 @@ import { vpnExtension, VpnExtensionAbility } from '@kit.NetworkKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { vpnNative } from '../common/NativeVpn';
-import { BUNDLE_NAME, EVENT_ERROR, EVENT_READY, EVENT_STOPPED, publishVpnEvent } from '../common/VpnEvents';
+import {
+  BUNDLE_NAME,
+  EVENT_ERROR,
+  EVENT_READY,
+  EVENT_STOPPED,
+  EVENT_TRAFFIC,
+  publishVpnEvent
+} from '../common/VpnEvents';
 
 const TAG: string = 'CharlesVpnExt';
 const LOG_DOMAIN: number = 0xC0DE;
@@ -38,7 +45,16 @@ export default class CharlesVpnExtensionAbility extends VpnExtensionAbility {
       const targetIp: string = String(want.parameters?.targetIp ?? '');
       const targetPort: number = Number(want.parameters?.targetPort ?? 0);
       const targetBundle: string = String(want.parameters?.targetBundle ?? '').trim();
+      hilog.info(LOG_DOMAIN, TAG, 'VPN target bundle: %{public}s',
+        targetBundle.length > 0 ? targetBundle : '(global)');
       vpnNative.setVpnEventCallback((message: string) => {
+        // 实时流量事件频率高且每条都不同，不做错误去重，直接转发给 UI。
+        if (message.startsWith('trace\t')) {
+          hilog.info(LOG_DOMAIN, TAG, 'trace forward len=%{public}d head=%{public}s',
+            message.length, message.substring(0, 24));
+          publishVpnEvent(EVENT_TRAFFIC, message);
+          return;
+        }
         const now: number = Date.now();
         if (message === this.lastForwardError && now - this.lastForwardErrorAt < 3000) {
           return;

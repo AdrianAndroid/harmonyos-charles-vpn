@@ -13,8 +13,10 @@
 
 #include <cassert>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 using namespace charles;
 
@@ -58,6 +60,29 @@ void build_packet(std::string& out, uint16_t sport, uint16_t dport, uint32_t seq
     }
 }
 
+std::string b64decode(const std::string& input) {
+    static const char table[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int lookup[256];
+    for (int& value : lookup) value = -1;
+    for (int i = 0; i < 64; ++i) lookup[static_cast<unsigned char>(table[i])] = i;
+    std::string out;
+    uint32_t buffer = 0;
+    int bits = 0;
+    for (char c : input) {
+        if (c == '=') break;
+        int value = lookup[static_cast<unsigned char>(c)];
+        if (value < 0) continue;
+        buffer = (buffer << 6) | static_cast<uint32_t>(value);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<char>((buffer >> bits) & 0xff));
+        }
+    }
+    return out;
+}
+
 bool wait_readable(int fd, int timeout_ms) {
     pollfd pfd{fd, POLLIN, 0};
     int rc = poll(&pfd, 1, timeout_ms);
@@ -87,6 +112,7 @@ bool read_packet(int fd, std::string& pkt) {
 struct ServerCtx {
     int port = 0;
     bool got_absolute_form = false;
+    bool chunked = false;
     std::string received;
 };
 
@@ -115,22 +141,35 @@ void charles_server(ServerCtx* ctx) {
     }
     ctx->received = req;
     ctx->got_absolute_form = req.find("GET http://example.com/ HTTP/1.1") == 0;
-    const std::string resp = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    const std::string resp = ctx->chunked
+                                 ? "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                                   "5\r\nhello\r\n0\r\n\r\n"
+                                 : "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
     const char* p = resp.data();
     size_t left = resp.size();
-    while (left > 0) {
-        ssize_t n = ::write(cfd, p, left);
-        if (n <= 0) break;
-        p += n;
-        left -= static_cast<size_t>(n);
+    if (ctx->chunked) {
+        // Split the chunked framing across many upstream reads so the trace
+        // parser must retain partial chunk-size/CRLF state.
+        for (size_t i = 0; i < resp.size(); ++i) {
+            if (::write(cfd, resp.data() + i, 1) != 1) break;
+            usleep(1000);
+        }
+    } else {
+        while (left > 0) {
+            ssize_t n = ::write(cfd, p, left);
+            if (n <= 0) break;
+            p += n;
+            left -= static_cast<size_t>(n);
+        }
     }
     shutdown(cfd, SHUT_WR);  // upstream EOF -> proxy must FIN after the data
     close(cfd);
 }
 
-bool run_full_flow(bool delay_first_ack) {
+bool run_full_flow(bool delay_first_ack, bool chunked) {
     const bool want_retrans = delay_first_ack;
     ServerCtx ctx;
+    ctx.chunked = chunked;
     std::thread server(charles_server, &ctx);
     while (ctx.port == 0) usleep(5000);
 
@@ -139,6 +178,12 @@ bool run_full_flow(bool delay_first_ack) {
     assert(socketpair(AF_LOCAL, SOCK_DGRAM, 0, sp) == 0);
 
     TunProxy proxy;
+    std::mutex trace_mutex;
+    std::vector<std::string> traces;
+    proxy.set_event_callback([&](const std::string& message) {
+        std::lock_guard<std::mutex> guard(trace_mutex);
+        traces.push_back(message);
+    });
     std::string err;
     assert(proxy.configure("127.0.0.1", static_cast<uint16_t>(ctx.port), err));
     assert(proxy.attach(sp[1], err));
@@ -182,7 +227,7 @@ bool run_full_flow(bool delay_first_ack) {
     bool saw_fin = false;
     bool saw_retransmission = false;
     int guard = 0;
-    while (!saw_fin && guard++ < 50) {
+    while (!saw_fin && guard++ < 400) {
         if (!read_packet(sp[0], pkt)) break;
         th = reinterpret_cast<const TcpHeader*>(pkt.data() + 20);
         uint8_t flags = static_cast<uint8_t>(ntohs(th->data_offset_flags) & 0xff);
@@ -226,7 +271,11 @@ bool run_full_flow(bool delay_first_ack) {
         }
     }
     assert(saw_fin);
-    assert(body == "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    const std::string expected = chunked
+                                     ? "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                                       "5\r\nhello\r\n0\r\n\r\n"
+                                     : "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    assert(body == expected);
 
     proxy.stop();
     assert(!proxy.is_running());
@@ -235,6 +284,50 @@ bool run_full_flow(bool delay_first_ack) {
     server.join();
 
     assert(ctx.got_absolute_form);
+
+    bool saw_flow = false;
+    bool saw_req = false;
+    bool saw_resp = false;
+    bool saw_body = false;
+    bool saw_full_body = false;
+    bool saw_close = false;
+    std::lock_guard<std::mutex> trace_guard(trace_mutex);
+    for (const std::string& message : traces) {
+        if (message.rfind("trace\t", 0) != 0) continue;
+        if (message.find("trace\tflow\t") == 0) saw_flow = true;
+        if (message.find("trace\treq\t") == 0) {
+            saw_req = true;
+            assert(message.find("\tGET\texample.com\t/\t") != std::string::npos);
+        }
+        if (message.find("trace\tresp\t") == 0) {
+            saw_resp = true;
+            if (!chunked) {
+                assert(message.find("\t5\t") != std::string::npos);
+            }
+        }
+        if (message.find("trace\tbody\t") == 0) {
+            saw_body = true;
+            std::string body_b64;
+            size_t start = 0;
+            for (int field = 0; field < 4; ++field) {
+                start = message.find('\t', start);
+                assert(start != std::string::npos);
+                ++start;
+            }
+            size_t end = message.find('\t', start);
+            body_b64 = message.substr(start, end == std::string::npos ? std::string::npos
+                                                                     : end - start);
+            if (b64decode(body_b64) == "hello") saw_full_body = true;
+        }
+        if (message.find("trace\tclose\t") == 0) saw_close = true;
+    }
+    assert(saw_flow);
+    assert(saw_req);
+    assert(saw_resp);
+    assert(saw_body);
+    assert(saw_full_body);
+    assert(saw_close);
+
     return saw_retransmission;
 }
 
@@ -259,7 +352,8 @@ int main() {
     CLIENT_IP = inet_addr("10.0.0.1");
     DEST_IP = inet_addr("1.2.3.4");
     test_configure_validation();
-    run_full_flow(false);            // normal in-order path
-    assert(run_full_flow(true));     // withheld ACK must force a retransmit
+    run_full_flow(false, false);            // normal in-order path
+    assert(run_full_flow(true, false));     // withheld ACK must force a retransmit
+    run_full_flow(false, true);             // chunked response preview
     return 0;
 }

@@ -19,6 +19,7 @@ struct RequestHeaderInfo {
     std::string rewritten;            // absolute-form header block when ready
     std::string method;
     std::string host;
+    std::string target;               // raw request-target from the request line
     bool chunked = false;             // Transfer-Encoding: chunked
     bool has_content_length = false;
     int64_t content_length = 0;       // valid only when has_content_length

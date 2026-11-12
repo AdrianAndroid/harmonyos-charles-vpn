@@ -65,6 +65,7 @@ RequestHeaderInfo analyze_request_header(const std::string& input, const std::st
     info.method = first.substr(0, a);
     std::string target = first.substr(a + 1, b - a - 1);
     std::string version = first.substr(b + 1);
+    info.target = target;
     if (!std::all_of(info.method.begin(), info.method.end(), token_char) ||
         (version != "HTTP/1.1" && version != "HTTP/1.0") || info.method == "CONNECT") {
         info.result = RequestResult::invalid;

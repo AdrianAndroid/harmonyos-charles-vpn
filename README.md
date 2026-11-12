@@ -9,6 +9,7 @@
 - 已在 API 26 真机完成签名安装和应用启动，VPN 界面已显示“运行中”并保存 Charles 历史记录。
 - 主机测试：HTTP 分包/组包、请求头重写、IPv4 分片、TCP 握手/ACK/重传、模拟 TUN 端到端 GET 均通过。
 - 支持可搜索的常用应用选择器：内置快手、快手极速版，可添加自定义常用项并记住上次选择；指定应用时使用官方 `VpnConfig.trustedApplications`，选择“全部应用”则为全局模式。
+- “流量”页以整页可滚动列表（类似终端回滚视窗）实时展示 TCP/HTTP 会话，基于 `LazyForEach` 按需渲染、单行局部刷新，点击任意条目可展开请求头、响应头与响应体前 1KB 详情；总览同步显示活动连接与收发字节数。数据只在内存中保留最近 500 条连接。
 - Charles 断点、rewrite、map local、限流的逐项真机回归仍应在使用时按文档验证，不以“VPN 已运行”替代报文级验收。
 
 验证记录见 [docs/VALIDATION.md](docs/VALIDATION.md)。
@@ -48,7 +49,8 @@ cli2api-flicker/
 │   ├── USAGE.md                          # Charles、签名、真机使用步骤
 │   ├── RISKS.md                          # 方案差异、限制与风险
 │   ├── TROUBLESHOOTING.md                # 故障排查清单
-│   └── VALIDATION.md                     # 已执行验证与待验收项
+│   ├── VALIDATION.md                     # 已执行验证与待验收项
+│   └── AI_HANDOFF.md                     # AI 接续摘要与下一步建议
 └── README.md
 ```
 
@@ -135,3 +137,4 @@ tests/run_host_tests.sh
 - [方案风险与限制](docs/RISKS.md)
 - [常见故障排查](docs/TROUBLESHOOTING.md)
 - [构建和测试验证记录](docs/VALIDATION.md)
+- [AI 交接摘要与下一步建议](docs/AI_HANDOFF.md)

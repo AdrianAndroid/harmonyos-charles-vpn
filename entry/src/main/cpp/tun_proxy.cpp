@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <cstdlib>
 #include <cerrno>
 #include <ctime>
 #include <exception>
@@ -42,6 +43,61 @@ bool set_nonblocking(int fd) {
 }
 
 uint32_t wrap_add(uint32_t a, uint32_t b) { return static_cast<uint32_t>(a + b); }
+
+// Base64 is used only for UI trace payloads. Trace messages are tab-delimited,
+// so HTTP headers/bodies must not inject separators or newlines.
+std::string base64_encode(const std::string& input) {
+    static const char table[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((input.size() + 2) / 3 * 4);
+    size_t i = 0;
+    while (i + 3 <= input.size()) {
+        uint32_t n = (static_cast<uint8_t>(input[i]) << 16) |
+                     (static_cast<uint8_t>(input[i + 1]) << 8) |
+                     static_cast<uint8_t>(input[i + 2]);
+        out.push_back(table[(n >> 18) & 0x3f]);
+        out.push_back(table[(n >> 12) & 0x3f]);
+        out.push_back(table[(n >> 6) & 0x3f]);
+        out.push_back(table[n & 0x3f]);
+        i += 3;
+    }
+    if (i < input.size()) {
+        bool two_bytes = i + 1 < input.size();
+        uint32_t n = static_cast<uint8_t>(input[i]) << 16;
+        if (two_bytes) n |= static_cast<uint8_t>(input[i + 1]) << 8;
+        out.push_back(table[(n >> 18) & 0x3f]);
+        out.push_back(table[(n >> 12) & 0x3f]);
+        if (two_bytes) {
+            out.push_back(table[(n >> 6) & 0x3f]);
+            out.push_back('=');
+        } else {
+            out.push_back('=');
+            out.push_back('=');
+        }
+    }
+    return out;
+}
+
+std::string preview_b64(const std::string& text, size_t limit) {
+    return base64_encode(text.substr(0, std::min(text.size(), limit)));
+}
+
+std::string ascii_lower_copy(const std::string& text) {
+    std::string out = text;
+    for (char& c : out) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return out;
+}
+
+std::string trim_spaces(const std::string& text) {
+    size_t begin = 0;
+    while (begin < text.size() && (text[begin] == ' ' || text[begin] == '\t')) ++begin;
+    size_t end = text.size();
+    while (end > begin && (text[end - 1] == ' ' || text[end - 1] == '\t')) --end;
+    return text.substr(begin, end - begin);
+}
 
 }  // namespace
 
@@ -232,11 +288,13 @@ class TunProxy::Flow {
 public:
     enum class State { SYN_RCVD, CONNECTING, ESTABLISHED, FIN_WAIT, CLOSING, DEAD };
 
-    Flow(TunProxy* owner, const FlowKey& key) : owner_(owner), key_(key) {
-        iss_ = static_cast<uint32_t>(now_ms() ^ reinterpret_cast<uintptr_t>(this));
+    Flow(TunProxy* owner, const FlowKey& key)
+        : owner_(owner), key_(key), id_(owner->next_flow_id()), created_ms_(now_ms()) {
+        iss_ = static_cast<uint32_t>(created_ms_ ^ reinterpret_cast<uintptr_t>(this));
     }
 
     ~Flow() {
+        report_close_();
         if (sock_ >= 0) ::close(sock_);
     }
 
@@ -401,6 +459,38 @@ public:
 private:
     TunProxy* owner_;
     FlowKey key_;
+    uint64_t id_ = 0;
+    int64_t created_ms_ = 0;
+    bool close_reported_ = false;
+    bool trace_flow_started_ = false;
+    uint64_t request_bytes_ = 0;
+    uint64_t response_bytes_ = 0;
+    std::string last_method_;
+    std::string last_host_;
+    std::string last_target_;
+    int64_t last_request_ms_ = 0;
+    int response_index_ = 0;
+
+    std::string resp_parse_buf_;
+    bool resp_header_parsed_ = false;
+    bool resp_chunked_ = false;
+    bool resp_until_close_ = false;
+    bool resp_chunk_need_size_ = true;
+    bool resp_chunk_need_crlf_ = false;
+    bool resp_chunk_trailers_ = false;
+    size_t resp_chunk_remaining_ = 0;
+    size_t resp_body_remaining_ = 0;
+    size_t resp_body_bytes_ = 0;
+    size_t resp_content_length_ = 0;
+    bool resp_has_content_length_ = false;
+    std::string resp_status_line_;
+    std::string resp_header_raw_;
+    std::string resp_preview_;
+    bool resp_preview_emitted_ = false;
+    bool resp_parse_disabled_ = false;
+    int64_t resp_started_ms_ = 0;
+    int current_resp_index_ = 0;
+
     int sock_ = -1;
     State state_ = State::SYN_RCVD;
     bool connected_ = false;
@@ -571,6 +661,7 @@ private:
                     break;
                 }
                 tx_buf_.append(buf, static_cast<size_t>(n));
+                on_upstream_data_(buf, static_cast<size_t>(n));
                 continue;
             }
             if (n == 0) {
@@ -654,7 +745,6 @@ private:
     // up_out_. Bodies are framed explicitly so a body can never be parsed as the
     // next pipelined request header.
     void pump_app_(int64_t now) {
-        (void)now;
         if (state_ == State::DEAD || sock_ < 0 || !connected_) return;
         // Backpressure: stop draining the client receive buffer once enough
         // rewritten bytes are waiting for Charles. Our receive window closes,
@@ -688,6 +778,26 @@ private:
                     die_(true);
                     return;
                 }
+                if (!trace_flow_started_) {
+                    trace_flow_started_ = true;
+                    std::string src = ipv4_to_string(key_.client_addr) + ":" +
+                                      std::to_string(key_.client_port);
+                    std::string dst = ipv4_to_string(key_.dst_addr) + ":" +
+                                      std::to_string(key_.dst_port);
+                    owner_->report_trace("flow\t" + std::to_string(id_) + "\t" + src +
+                                         "\t" + dst + "\t" + std::to_string(now));
+                }
+                std::string original_header = app_in_.substr(0, info.consumed);
+                request_bytes_ += info.consumed;
+                last_method_ = info.method;
+                last_host_ = info.host.empty() ? ipv4_to_string(key_.dst_addr) : info.host;
+                last_target_ = info.target;
+                last_request_ms_ = now;
+                resp_started_ms_ = now;
+                owner_->report_trace("req\t" + std::to_string(id_) + "\t" + info.method +
+                                     "\t" + last_host_ + "\t" + last_target_ + "\t" +
+                                     preview_b64(original_header, 1024) + "\t" +
+                                     std::to_string(now));
                 up_out_ += info.rewritten;
                 app_in_.erase(0, info.consumed);
                 if (info.chunked) {
@@ -711,6 +821,7 @@ private:
                 }
                 up_out_.append(app_in_.data(), n);
                 app_in_.erase(0, n);
+                request_bytes_ += n;
                 body_remaining_ -= static_cast<int64_t>(n);
                 if (body_remaining_ == 0) phase_ = BodyPhase::REQUEST_HEADER;
                 progressed = true;
@@ -732,6 +843,7 @@ private:
                     if (rest.size() >= 2 && rest[0] == '\r' && rest[1] == '\n') {
                         up_out_.append(app_in_.data(), hlen + 2);
                         app_in_.erase(0, hlen + 2);
+                        request_bytes_ += hlen + 2;
                         phase_ = BodyPhase::REQUEST_HEADER;
                         progressed = true;
                         continue;
@@ -741,6 +853,7 @@ private:
                     size_t take = hlen + term + 4;
                     up_out_.append(app_in_.data(), take);
                     app_in_.erase(0, take);
+                    request_bytes_ += take;
                     phase_ = BodyPhase::REQUEST_HEADER;
                     progressed = true;
                     continue;
@@ -750,9 +863,255 @@ private:
                 if (app_in_.size() < need) return;
                 up_out_.append(app_in_.data(), need);
                 app_in_.erase(0, need);
+                request_bytes_ += need;
                 progressed = true;
             }
         }
+    }
+
+    void on_upstream_data_(const char* data, size_t len) {
+        response_bytes_ += len;
+        if (resp_parse_disabled_) return;
+        resp_parse_buf_.append(data, len);
+        if (resp_parse_buf_.size() > 256u * 1024u) {
+            resp_parse_buf_.clear();
+            resp_parse_disabled_ = true;
+            return;
+        }
+        parse_responses_();
+    }
+
+    void parse_responses_() {
+        while (!resp_parse_buf_.empty()) {
+            if (!resp_header_parsed_) {
+                size_t end = resp_parse_buf_.find("\r\n\r\n");
+                if (end == std::string::npos) {
+                    if (resp_parse_buf_.size() > 65536u) {
+                        resp_parse_buf_.clear();
+                        resp_parse_disabled_ = true;
+                    }
+                    return;
+                }
+                resp_header_raw_ = resp_parse_buf_.substr(0, end + 4);
+                resp_parse_buf_.erase(0, end + 4);
+                size_t line_end = resp_header_raw_.find("\r\n");
+                resp_status_line_ = line_end == std::string::npos
+                                        ? std::string()
+                                        : resp_header_raw_.substr(0, line_end);
+                resp_chunked_ = false;
+                resp_has_content_length_ = false;
+                resp_content_length_ = 0;
+                resp_body_remaining_ = 0;
+                resp_body_bytes_ = 0;
+                resp_preview_.clear();
+                resp_preview_emitted_ = false;
+                resp_chunk_need_size_ = true;
+                resp_chunk_need_crlf_ = false;
+                resp_chunk_trailers_ = false;
+                resp_chunk_remaining_ = 0;
+                size_t pos = line_end == std::string::npos ? resp_header_raw_.size()
+                                                           : line_end + 2;
+                while (pos < resp_header_raw_.size()) {
+                    size_t next = resp_header_raw_.find("\r\n", pos);
+                    if (next == std::string::npos || next == pos) break;
+                    std::string line = resp_header_raw_.substr(pos, next - pos);
+                    size_t colon = line.find(':');
+                    if (colon != std::string::npos) {
+                        std::string name = ascii_lower_copy(trim_spaces(line.substr(0, colon)));
+                        std::string value = trim_spaces(line.substr(colon + 1));
+                        if (name == "content-length" && value.find(',') == std::string::npos) {
+                            char* tail = nullptr;
+                            unsigned long long parsed = std::strtoull(value.c_str(), &tail, 10);
+                            if (tail != value.c_str() && *tail == '\0') {
+                                resp_has_content_length_ = true;
+                                resp_content_length_ = static_cast<size_t>(parsed);
+                            }
+                        } else if (name == "transfer-encoding" &&
+                                   ascii_lower_copy(value) == "chunked") {
+                            resp_chunked_ = true;
+                        }
+                    }
+                    pos = next + 2;
+                }
+                // HEAD, 1xx, 204 and 304 responses never carry a body even
+                // when they advertise Content-Length. Treat them as complete so
+                // the parser does not stall before the next keep-alive response.
+                std::string status_code;
+                size_t sp1 = resp_status_line_.find(' ');
+                if (sp1 != std::string::npos) {
+                    size_t sp2 = resp_status_line_.find(' ', sp1 + 1);
+                    status_code = resp_status_line_.substr(
+                        sp1 + 1, sp2 == std::string::npos ? std::string::npos : sp2 - sp1 - 1);
+                }
+                bool bodyless = last_method_ == "HEAD" || status_code == "204" ||
+                                status_code == "304" ||
+                                (!status_code.empty() && status_code[0] == '1');
+                if (bodyless) {
+                    resp_chunked_ = false;
+                    resp_has_content_length_ = true;
+                    resp_content_length_ = 0;
+                }
+                resp_header_parsed_ = true;
+                resp_until_close_ = !resp_chunked_ && !resp_has_content_length_;
+                resp_body_remaining_ = resp_has_content_length_ ? resp_content_length_ : 0;
+                current_resp_index_ = response_index_++;
+                resp_started_ms_ = now_ms();
+                owner_->report_trace(
+                    "resp\t" + std::to_string(id_) + "\t" +
+                    std::to_string(current_resp_index_) + "\t" +
+                    base64_encode(resp_status_line_) + "\t" +
+                    preview_b64(resp_header_raw_, 2048) + "\t" +
+                    std::to_string(resp_content_length_) + "\t" +
+                    std::to_string(resp_started_ms_));
+                if (!resp_chunked_ && resp_has_content_length_ && resp_content_length_ == 0) {
+                    finish_response_();
+                }
+                continue;
+            }
+
+            if (resp_chunked_) {
+                if (resp_chunk_trailers_) {
+                    if (resp_parse_buf_.compare(0, 2, "\r\n") == 0) {
+                        resp_parse_buf_.erase(0, 2);
+                        finish_response_();
+                        continue;
+                    }
+                    size_t trailer_end = resp_parse_buf_.find("\r\n\r\n");
+                    if (trailer_end == std::string::npos) return;
+                    resp_parse_buf_.erase(0, trailer_end + 4);
+                    finish_response_();
+                    continue;
+                }
+                if (resp_chunk_need_crlf_) {
+                    if (resp_parse_buf_.size() < 2) return;
+                    resp_parse_buf_.erase(0, 2);
+                    resp_chunk_need_crlf_ = false;
+                    resp_chunk_need_size_ = true;
+                    continue;
+                }
+                if (resp_chunk_need_size_) {
+                    size_t line = resp_parse_buf_.find("\r\n");
+                    if (line == std::string::npos) return;
+                    size_t value = 0;
+                    bool ok = line > 0;
+                    for (size_t i = 0; i < line && ok; ++i) {
+                        char c = resp_parse_buf_[i];
+                        if (c == ';') break;
+                        if (c >= '0' && c <= '9') value = value * 16 + static_cast<size_t>(c - '0');
+                        else if (c >= 'a' && c <= 'f') value = value * 16 + static_cast<size_t>(c - 'a' + 10);
+                        else if (c >= 'A' && c <= 'F') value = value * 16 + static_cast<size_t>(c - 'A' + 10);
+                        else { ok = false; break; }
+                    }
+                    resp_parse_buf_.erase(0, line + 2);
+                    if (!ok) {
+                        resp_parse_disabled_ = true;
+                        resp_parse_buf_.clear();
+                        return;
+                    }
+                    if (value == 0) {
+                        resp_chunk_need_size_ = false;
+                        resp_chunk_trailers_ = true;
+                        continue;
+                    }
+                    resp_chunk_remaining_ = value;
+                    resp_chunk_need_size_ = false;
+                    resp_chunk_need_crlf_ = false;
+                }
+                size_t take = std::min(resp_chunk_remaining_, resp_parse_buf_.size());
+                if (take == 0) return;
+                append_preview_(resp_parse_buf_.data(), take);
+                resp_parse_buf_.erase(0, take);
+                resp_chunk_remaining_ -= take;
+                resp_body_bytes_ += take;
+                maybe_emit_preview_();
+                if (resp_chunk_remaining_ == 0) {
+                    resp_chunk_need_crlf_ = true;
+                }
+                continue;
+            }
+
+            if (resp_until_close_) {
+                if (!resp_parse_buf_.empty()) {
+                    append_preview_(resp_parse_buf_.data(), resp_parse_buf_.size());
+                    resp_body_bytes_ += resp_parse_buf_.size();
+                    resp_parse_buf_.clear();
+                    maybe_emit_preview_();
+                }
+                return;
+            }
+
+            if (resp_body_remaining_ == 0) {
+                finish_response_();
+                continue;
+            }
+            size_t take = std::min(resp_body_remaining_, resp_parse_buf_.size());
+            if (take == 0) return;
+            append_preview_(resp_parse_buf_.data(), take);
+            resp_parse_buf_.erase(0, take);
+            resp_body_remaining_ -= take;
+            resp_body_bytes_ += take;
+            maybe_emit_preview_();
+            if (resp_body_remaining_ == 0) {
+                finish_response_();
+            }
+        }
+    }
+
+    void append_preview_(const char* data, size_t len) {
+        constexpr size_t PREVIEW_CAP = 1024;
+        if (resp_preview_.size() < PREVIEW_CAP) {
+            size_t take = std::min(len, PREVIEW_CAP - resp_preview_.size());
+            resp_preview_.append(data, take);
+        }
+    }
+
+    void maybe_emit_preview_() {
+        if (resp_preview_emitted_ || resp_preview_.empty()) return;
+        resp_preview_emitted_ = true;
+        emit_body_trace_();
+    }
+
+    void finish_response_() {
+        emit_body_trace_();
+        resp_header_parsed_ = false;
+        resp_chunked_ = false;
+        resp_until_close_ = false;
+        resp_has_content_length_ = false;
+        resp_content_length_ = 0;
+        resp_body_remaining_ = 0;
+        resp_body_bytes_ = 0;
+        resp_status_line_.clear();
+        resp_header_raw_.clear();
+        resp_preview_.clear();
+        resp_preview_emitted_ = false;
+        resp_chunk_need_size_ = true;
+        resp_chunk_need_crlf_ = false;
+        resp_chunk_trailers_ = false;
+        resp_chunk_remaining_ = 0;
+        resp_started_ms_ = 0;
+    }
+
+    void emit_body_trace_() {
+        int64_t now = now_ms();
+        int64_t duration = last_request_ms_ > 0 ? now - last_request_ms_ : 0;
+        owner_->report_trace("body\t" + std::to_string(id_) + "\t" +
+                             std::to_string(current_resp_index_) + "\t" +
+                             preview_b64(resp_preview_, 1024) + "\t" +
+                             std::to_string(resp_body_bytes_) + "\t" +
+                             std::to_string(duration));
+    }
+
+    void report_close_() {
+        if (!trace_flow_started_ || close_reported_) return;
+        if (resp_header_parsed_ && resp_until_close_) {
+            emit_body_trace_();
+        }
+        close_reported_ = true;
+        int64_t now = now_ms();
+        owner_->report_trace("close\t" + std::to_string(id_) + "\t" +
+                             std::to_string(request_bytes_) + "\t" +
+                             std::to_string(response_bytes_) + "\t" +
+                             std::to_string(now - created_ms_));
     }
 
     void die_(bool send_reset) {
@@ -896,6 +1255,11 @@ void TunProxy::report_event(const std::string& message) {
         cb = event_cb_;
     }
     if (cb) cb(message);
+}
+
+void TunProxy::report_trace(const std::string& payload) {
+    LOGI("trace emit len=%zu kind=%.12s", payload.size(), payload.c_str());
+    report_event("trace\t" + payload);
 }
 
 void TunProxy::emit_packet(const void* data, size_t len) {
@@ -1129,6 +1493,7 @@ void TunProxy::handle_tcp(const Ipv4Header* ip, const uint8_t* transport, size_t
             send_rst(ip, th, seg_len);
             return;
         }
+        LOGI("tcp flow dst=%s:%u", ipv4_to_string(key.dst_addr).c_str(), key.dst_port);
         auto flow = std::make_unique<Flow>(this, key);
         flow->on_syn(th, now);
         flows_.emplace(key, std::move(flow));

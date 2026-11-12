@@ -28,6 +28,7 @@ tests/run_host_tests.sh
 3. 重复/冲突 Content-Length、Transfer-Encoding + Content-Length、重复 Host、CONNECT 的拒绝。
 4. IPv4/TCP 校验和、分片缺口/重叠/超时、TCP 32 位序号回绕。
 5. 使用 socketpair 模拟 TUN 与本地 TCP Charles 的端到端流程：SYN/SYNACK/ACK、GET 转换、响应 MSS 分段、实际重传、FIN、重复停止与参数校验。
+6. 实时流量事件：同一条端到端 GET 上断言 `flow`、`req`（GET/example.com//）、`resp`（Content-Length 5）、`body`（base64 解码为 `hello`）和 `close` 事件均产生；chunked 响应也能解析出 `hello` 预览。
 
 主机测试使用 macOS clang++，`-std=c++17 -Wall -Wextra -Werror`。它不能覆盖 HarmonyOS 的 TUN 驱动、系统授权、签名或真实 ArkTS 运行时。
 
@@ -72,3 +73,4 @@ entry/build/default/intermediates/libs/default/arm64-v8a/libcharles_vpn.so
 - 真机 DNS 中继、复杂 POST/keep-alive、乱序和弱网行为。
 - Charles 中途关闭、Wi-Fi 切换、长时间断点和应用重启后的更多边界场景。
 - 其他目标 Bundle 与多个被测 App 的范围对照测试；当前已用本应用的真实 Bundle 验证官方 `trustedApplications` 配置链路。
+- 实时流量面板修改后的真机端到端显示：本次修改完成后测试设备已断开，仅完成 Native 事件的主机端到端断言和 HAP 编译；需在真机连接 Charles 后补一次面板实测。
